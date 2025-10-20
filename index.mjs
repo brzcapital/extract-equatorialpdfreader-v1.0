@@ -67,7 +67,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 const num = (v) => {
   if (v === null || v === undefined) return null;
   const s = v.toString().replace(/\s+/g, "").replace(/\./g, "").replace(",", ".");
-@@ -69,13 +72,8 @@ const safe2 = (x) => (x === null ? null : parseFloat(x.toFixed(2)));
+const safe2 = (x) => (x === null ? null : parseFloat(x.toFixed(2)));
 const stripAccents = (s) => (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 const looksPrice = (x) => Number.isFinite(x) && x > 0 && x < 2;
 const looksKwh = (x) => Number.isFinite(x) && x >= 1 && x < 100000;
@@ -82,7 +82,7 @@ const approxEqual = (a, b, tol = 0.005) => {
 async function readPdfTokens(buffer) {
   return new Promise((resolve, reject) => {
     const reader = new PdfReader();
-@@ -85,7 +83,8 @@ async function readPdfTokens(buffer) {
+async function readPdfTokens(buffer) {
       if (err) return reject(err);
       if (!item) return resolve(tokens);
       if (item.page) page = item.page;
@@ -92,7 +92,7 @@ async function readPdfTokens(buffer) {
     });
   });
 }
-@@ -114,7 +113,9 @@ function buildNormalizedLines(tokens) {
+function buildNormalizedLines(tokens) {
     const rows = {};
     const tol = 0.004;
     for (const tk of norm) {
@@ -103,7 +103,7 @@ async function readPdfTokens(buffer) {
       const bucket = key ?? tk.ny.toFixed(4);
       rows[bucket] = rows[bucket] || [];
       rows[bucket].push(tk);
-@@ -125,70 +126,134 @@ function buildNormalizedLines(tokens) {
+ function buildNormalizedLines(tokens) {
       for (let i = 0; i < toks.length; i++) {
         const cur = toks[i];
         const nxt = toks[i + 1];
