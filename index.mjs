@@ -4,6 +4,9 @@
 // ==========================================
 // index.mjs v7.1 - Extract Equatorial Goiás (pdfreader) 19/10  21:00
 // ==========================================
+// ==========================================
+// index.mjs v7.2 - Extract Equatorial Goiás (pdfreader) 19/10 21:07
+// ==========================================
 import express from "express";
 import multer from "multer";
 import { PdfReader } from "pdfreader";
@@ -31,7 +34,13 @@ async function readPdfLines(buffer) {
       if (!item) {
         const lines = Object.keys(rows)
           .sort((a, b) => parseFloat(a) - parseFloat(b))
-          .map((y) => rows[y].sort((a, b) => a.x - b.x).map((i) => i.text).join(" ").trim());
+          .map((y) =>
+            rows[y]
+              .sort((a, b) => a.x - b.x)
+              .map((i) => i.text)
+              .join(" ")
+              .trim()
+          );
         return resolve(lines);
       }
       if (item.text) {
@@ -44,9 +53,14 @@ async function readPdfLines(buffer) {
 }
 
 // Função principal de extração
-async function extractData(fileBuffer) {
+async function extractData(fileBuffer, debugMode = false) {
   const lines = await readPdfLines(fileBuffer);
   const text = lines.join("\n");
+
+  if (debugMode) {
+    console.log("=== DEBUG MODE: Linhas extraídas do PDF ===");
+    lines.forEach((l, i) => console.log(`[${i}] ${l}`));
+  }
 
   const get = (regex, i = 1) => {
     const m = text.match(regex);
@@ -61,7 +75,8 @@ async function extractData(fileBuffer) {
 
   const total_a_pagar = num(get(/TOTAL.*PAGAR.*?([\d.,]+)/i));
   const data_vencimento = get(/VENCIMENTO.*?(\d{2}\/\d{2}\/\d{4})/i);
-  const data_emissao = get(/EMISS[ÃA]O.*?(\d{2}\/\d{2}\/\d{4})/i);
+
+  let data_emissao = get(/EMISS[ÃA]O.*?(\d{2}\/\d{2}\/\d{4})/i);
 
   // --- Datas agrupadas na tabela
   const allDates = Array.from(text.matchAll(/(\d{2}\/\d{2}\/\d{4})/g)).map((m) => m[1]);
@@ -69,8 +84,10 @@ async function extractData(fileBuffer) {
     data_leitura_atual = null,
     data_proxima_leitura = null,
     apresentacao = null;
-  if (allDates.length >= 4) {
-    [data_leitura_anterior, data_leitura_atual, data_proxima_leitura, data_emissao] = allDates.slice(0, 4);
+
+  if (allDates.length >= 3) {
+    [data_leitura_anterior, data_leitura_atual, data_proxima_leitura] = allDates.slice(0, 3);
+    if (!data_emissao && allDates[3]) data_emissao = allDates[3];
   }
 
   const mes_ano_referencia = get(/([A-Z]{3}\/\d{4})/i);
@@ -120,7 +137,7 @@ async function extractData(fileBuffer) {
       }
     }
   });
-  // Agrupar por UC única
+
   const uniqueInjecoes = Object.values(
     injecoes_scee.reduce((acc, cur) => {
       if (!acc[cur.uc]) acc[cur.uc] = cur;
@@ -149,7 +166,7 @@ async function extractData(fileBuffer) {
   const observacoes = get(/OBSERVA[CÇ][AÃ]O.*?([\s\S]+)/i);
 
   // ---------- RETORNO FINAL ----------
-  return {
+  const resultado = {
     unidade_consumidora,
     total_a_pagar: total_a_pagar ? parseFloat(total_a_pagar.toFixed(2)) : null,
     data_vencimento,
@@ -184,13 +201,16 @@ async function extractData(fileBuffer) {
     informacoes_para_o_cliente: informacoes_para_o_cliente || null,
     observacoes: observacoes || null,
   };
+
+  return debugMode ? { debug_lines: lines, resultado } : resultado;
 }
 
 // ---------- ROTAS ----------
 app.post("/extract", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Arquivo não enviado" });
-    const data = await extractData(req.file.buffer);
+    const debugMode = req.query.debug === "true";
+    const data = await extractData(req.file.buffer, debugMode);
     res.json(data);
   } catch (err) {
     console.error("❌ Erro na extração:", err);
@@ -202,7 +222,7 @@ app.get("/health", (req, res) => {
   const mem = process.memoryUsage();
   res.json({
     status: "online",
-    app_name: "extract-equatorialpdfreader-v7.1",
+    app_name: "extract-equatorialpdfreader-v7.2",
     environment: process.env.NODE_ENV || "production",
     node_version: process.version,
     uptime_seconds: process.uptime(),
@@ -218,5 +238,7 @@ app.get("/health", (req, res) => {
 });
 
 app.listen(process.env.PORT || 10000, () => {
-  console.log("✅ Servidor Equatorial Goiás (pdfreader v7.1) na porta 10000");
+  console.log("✅ Servidor Equatorial Goiás (pdfreader v7.2) na porta 10000");
 });
+
+
