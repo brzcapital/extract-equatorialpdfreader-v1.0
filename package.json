@@ -1,5 +1,5 @@
 {
-  "name": "extract-equatorialpdfreader-v7.3",
+  "name": "extract-equatorialpdfreader-v8",
   "version": "1.0.0",
   "type": "module",
   "main": "index.mjs",
@@ -7,9 +7,9 @@
     "start": "node index.mjs"
   },
   "dependencies": {
+    "dayjs": "^1.11.10",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
-    "pdfreader": "^3.0.6",
-    "dayjs": "^1.11.10"
+    "pdfreader": "^3.0.6"
   }
 }
