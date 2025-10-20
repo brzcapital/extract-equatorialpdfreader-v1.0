@@ -89,7 +89,7 @@ async function readPdfTokens(buffer) {
       if (item.text) tokens.push({ page, x: item.x, y: item.y, text: item.text.trim() });
       if (item.text)
         tokens.push({ page, x: item.x, y: item.y, text: item.text.trim() });
-    });
+    };
   });
 }
 function buildNormalizedLines(tokens) {
