@@ -10,6 +10,9 @@
 // ==========================================
 // index.mjs v7.3 - Extract Equatorial Goiás (pdfreader) 19/10 21:15
 // ==========================================
+// ==========================================
+// index.mjs v8 - Extract Equatorial Goiás (pdfreader, anchors + validations)   19/10 21:36
+// ==========================================
 import express from "express";
 import multer from "multer";
 import { PdfReader } from "pdfreader";
@@ -19,7 +22,7 @@ import os from "os";
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// --------------------- Utils ---------------------
+/* --------------------- Utils --------------------- */
 const num = (v) => {
   if (v === null || v === undefined) return null;
   const s = v.toString().replace(/\s+/g, "").replace(/\./g, "").replace(",", ".");
@@ -29,209 +32,333 @@ const num = (v) => {
 const isDate = (s) => /^\d{2}\/\d{2}\/\d{4}$/.test(s);
 const isUC = (s) => /^\d{6,15}$/.test(s);
 const looksMoney = (x) => Number.isFinite(x) && x >= 0 && x < 1000000;
-const looksPrice = (x) => Number.isFinite(x) && x > 0 && x < 2; // preço unitário kWh
-const looksKwh = (x) => Number.isFinite(x) && x >= 1 && x < 100000; // quantidades
+const looksPrice = (x) => Number.isFinite(x) && x > 0 && x < 2; // R$/kWh
+const looksKwh = (x) => Number.isFinite(x) && x >= 1 && x < 100000; // kWh
 const safe2 = (x) => (x === null ? null : parseFloat(x.toFixed(2)));
+const approxEqual = (a, b, tol = 0.005) => {
+  if (a === null || b === null) return false;
+  if (a === 0 && b === 0) return true;
+  const d = Math.abs(a - b);
+  const r = Math.abs(b) > 0 ? d / Math.abs(b) : d;
+  return r <= tol;
+};
+const stripAccents = (s) =>
+  s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
-// --------------------- PDF parsing ---------------------
-// Lê tokens com X/Y e também linhas agrupadas, preservando ordem visual
-async function readPdfTokens(buffer) {
+/* --------------------- PDF parsing --------------------- */
+// Retorna um array de lineObjs ordenados por (page, y, x):
+// [{ page, y, tokens: [{x, text}], text }]
+async function readPdfLinesWithPositions(buffer) {
   return new Promise((resolve, reject) => {
     const reader = new PdfReader();
-    const rows = {}; // { yBucket: [ {x, text} ] }
+    const pages = {}; // {pageNum: { yBucket: [ {x, text} ] }}
+    let currentPage = 1;
+
     reader.parseBuffer(buffer, (err, item) => {
       if (err) return reject(err);
       if (!item) {
-        // montar estrutura final
-        const yKeys = Object.keys(rows).map((k) => parseFloat(k)).sort((a, b) => a - b);
-        const lineObjs = yKeys.map((y) => {
-          const tokens = rows[y].sort((a, b) => a.x - b.x);
-          return { y, tokens, text: tokens.map((t) => t.text).join(" ").trim() };
-        });
-        resolve(lineObjs);
+        // build
+        const all = [];
+        const pageNums = Object.keys(pages)
+          .map((k) => parseInt(k, 10))
+          .sort((a, b) => a - b);
+        for (const p of pageNums) {
+          const rows = pages[p];
+          const yKeys = Object.keys(rows)
+            .map((k) => parseFloat(k))
+            .sort((a, b) => a - b);
+          for (const y of yKeys) {
+            const tokens = rows[y].sort((a, b) => a.x - b.x);
+            const text = tokens.map((t) => t.text).join(" ").trim();
+            all.push({ page: p, y, tokens, text });
+          }
+        }
+        resolve(all);
         return;
       }
+      if (item.page) {
+        currentPage = item.page;
+        if (!pages[currentPage]) pages[currentPage] = {};
+      }
       if (item.text) {
-        // tolerância de y (±2 px): bucketiza por múltiplos de 2
-        const y = Math.round(item.y / 2) * 2;
-        rows[y] = rows[y] || [];
-        rows[y].push({ x: item.x, text: (item.text || "").trim() });
+        const y = Math.round(item.y / 2) * 2; // tolerância ±2px
+        if (!pages[currentPage]) pages[currentPage] = {};
+        pages[currentPage][y] = pages[currentPage][y] || [];
+        pages[currentPage][y].push({ x: item.x, text: (item.text || "").trim() });
       }
     });
   });
 }
 
-function toPlainLines(lineObjs) {
-  return lineObjs.map((l) => l.text);
-}
+// Helpers de busca
+const findLineObj = (lineObjs, re) => lineObjs.find((lo) => re.test(lo.text));
+const findAllLineObjs = (lineObjs, re) => lineObjs.filter((lo) => re.test(lo.text));
+const textFrom = (lineObjs) => lineObjs.map((lo) => lo.text).join("\n");
 
-function getText(lines) {
-  return lines.join("\n");
-}
+// Números extraídos de uma linha (já convertidos)
+const numbersInLine = (lo) =>
+  (lo.text.match(/[\d\.,]+/g) || []).map(num).filter((v) => v !== null);
 
-function firstMatch(text, regex, group = 1) {
-  const m = text.match(regex);
-  return m ? m[group] : null;
-}
+// Último número "dinheiro" viável de uma linha
+const lastMoneyInLine = (lo) => {
+  const vals = numbersInLine(lo).filter(looksMoney);
+  return vals.length ? vals[vals.length - 1] : null;
+};
 
-// --------------------- Core extraction ---------------------
+// Pega primeiro token que parece UC na linha
+const ucInLine = (lo) => {
+  const tok = lo.tokens.find((t) => isUC(t.text));
+  return tok ? tok.text : null;
+};
+
+// Busca bloco entre âncoras (regex) e retorna o slice de linhas
+const sliceBetween = (lineObjs, startRe, endRe) => {
+  const startIdx = lineObjs.findIndex((lo) => startRe.test(lo.text));
+  if (startIdx < 0) return [];
+  const endIdx = lineObjs.findIndex((lo, i) => i > startIdx && endRe.test(lo.text));
+  return endIdx > startIdx ? lineObjs.slice(startIdx, endIdx) : lineObjs.slice(startIdx);
+};
+
+/* --------------------- Core extraction --------------------- */
 async function extractData(fileBuffer, debugMode = false) {
-  const lineObjs = await readPdfTokens(fileBuffer);
-  const lines = toPlainLines(lineObjs);
-  const text = getText(lines);
+  const lineObjs = await readPdfLinesWithPositions(fileBuffer);
+  const text = textFrom(lineObjs);
+  const noAccText = stripAccents(text);
 
-  // ---------- DEBUG opcional ----------
-  if (debugMode) {
-    console.log("=== DEBUG LINES ===");
-    lines.forEach((l, i) => console.log(`[${i}] ${l}`));
-  }
+  const origins = {}; // map de origem de cada campo (para debug)
+  const warnings = [];
 
-  // ---------- Campos básicos ----------
-  // UC da fatura: priorizar "UNIDADE CONSUMIDORA" (evitar pegar UC GERADORA)
+  /* --------- UC da fatura (priorizar "Unidade Consumidora") --------- */
   let unidade_consumidora = null;
-  // 1) tentativa posicional: achar linha que contenha "UNID" e "CONSUM"
-  const ucLineObj = lineObjs.find((lo) => /UNID.*CONSUM/i.test(lo.text));
-  if (ucLineObj) {
-    const tok = ucLineObj.tokens.find((t) => isUC(t.text));
-    if (tok) unidade_consumidora = tok.text;
+
+  // 1) Linha explícita com "UNID.*CONSUM"
+  {
+    const lo = findLineObj(lineObjs, /UNID.*CONSUM/i);
+    if (lo) {
+      const uc = ucInLine(lo);
+      if (uc) {
+        unidade_consumidora = uc;
+        origins["unidade_consumidora"] = lo;
+      }
+    }
   }
-  // 2) fallback regex global (mas evitando confundir com "UC GERADORA")
+  // 2) Fallback: tentar UC isolada na página onde aparece REF (SET/AAAA)
   if (!unidade_consumidora) {
-    const m = text.match(/UNID.*CONSUM[^0-9]*?(\d{6,15})/i);
-    if (m) unidade_consumidora = m[1];
+    const ref = findLineObj(lineObjs, /[A-Z]{3}\/\d{4}/i);
+    if (ref) {
+      const samePage = lineObjs.filter((lo) => lo.page === ref.page);
+      // procurar número grande isolado que NÃO esteja em linha com "UC GERADORA"
+      for (const lo of samePage) {
+        if (/UC\s+GERADORA/i.test(lo.text)) continue;
+        const uc = ucInLine(lo);
+        if (uc) {
+          unidade_consumidora = uc;
+          origins["unidade_consumidora"] = lo;
+          break;
+        }
+      }
+    }
+  }
+  // 3) Fallback global (evitar confundir com UC geradora)
+  if (!unidade_consumidora) {
+    const m = noAccText.match(/UNIDADE\s+CONSUMIDORA[^0-9]*?(\d{6,15})/i);
+    if (m) {
+      unidade_consumidora = m[1];
+      origins["unidade_consumidora"] = "regex-global";
+    }
   }
 
-  // TOTAL A PAGAR com tolerância a quebras
-  // tenta posicional (linha que contenha TOTAL e PAGAR)
+  /* --------- TOTAL A PAGAR + VENCIMENTO (linha com R$**** + data) --------- */
   let total_a_pagar = null;
-  const totalLine = lineObjs.find((lo) => /TOTAL/i.test(lo.text) && /PAGAR/i.test(lo.text));
-  if (totalLine) {
-    // procurar o último número da linha como total
-    const nums = (totalLine.text.match(/[\d\.,]+/g) || []).map(num).filter(looksMoney);
-    if (nums.length) total_a_pagar = nums[nums.length - 1];
+  let data_vencimento = null;
+
+  // tentar achar linha com padrão R$******valor data
+  const payLine = lineObjs.find((lo) => /R\$\*+[\d\.,]+\s+\d{2}\/\d{2}\/\d{4}/.test(lo.text));
+  if (payLine) {
+    const m = payLine.text.match(/R\$\*+([\d\.,]+)\s+(\d{2}\/\d{2}\/\d{4})/);
+    if (m) {
+      total_a_pagar = num(m[1]);
+      data_vencimento = m[2];
+      origins["total_a_pagar"] = payLine;
+      origins["data_vencimento"] = payLine;
+    }
   }
-  // fallback global
+  // fallbacks
   if (total_a_pagar === null) {
-    total_a_pagar = num(firstMatch(text, /TOTAL\s*A\s*PAGAR[\s:R\$]*([\d\.,]+)/is));
+    const m = text.match(/TOTAL\s*A\s*PAGAR[\s:R\$*]*([\d\.,]+)/is);
+    if (m) {
+      total_a_pagar = num(m[1]);
+      origins["total_a_pagar"] = "regex-global";
+    }
+  }
+  if (!data_vencimento) {
+    const m = text.match(/VENC[IMEN]{3,10}\s*[:]*\s*(\d{2}\/\d{2}\/\d{4})/i);
+    if (m) {
+      data_vencimento = m[1];
+      origins["data_vencimento"] = "regex-global";
+    }
   }
   if (total_a_pagar !== null) total_a_pagar = safe2(total_a_pagar);
 
-  // VENCIMENTO com tolerância
-  let data_vencimento = null;
-  // posicional: linha com "VENC"
-  const vencLine = lineObjs.find((lo) => /VENC/i.test(lo.text));
-  if (vencLine) {
-    const tok = vencLine.tokens.find((t) => isDate(t.text));
-    if (tok) data_vencimento = tok.text;
+  /* --------- Datas: emissão, leituras, apresentação ---------- */
+  let data_emissao = null;
+  {
+    const lo = findLineObj(lineObjs, /EMISS[ÃA]O/i);
+    if (lo) {
+      const tok = lo.tokens.find((t) => isDate(t.text));
+      if (tok) {
+        data_emissao = tok.text;
+        origins["data_emissao"] = lo;
+      }
+    }
+    if (!data_emissao) {
+      const m = text.match(/EMISS[ÃA]O[^0-9]*?(\d{2}\/\d{2}\/\d{4})/i);
+      if (m) {
+        data_emissao = m[1];
+        origins["data_emissao"] = "regex-global";
+      }
+    }
   }
-  // fallback global
-  if (!data_vencimento) data_vencimento = firstMatch(text, /VENC[IMEN]{3,10}[\s:]*?(\d{2}\/\d{2}\/\d{4})/i);
 
-  // EMISSÃO
-  let data_emissao = firstMatch(text, /EMISS[ÃA]O.*?(\d{2}\/\d{2}\/\d{4})/i);
+  let data_leitura_anterior = null,
+    data_leitura_atual = null,
+    data_proxima_leitura = null,
+    apresentacao = null;
 
-  // Datas da tabela (pegar 3 em sequência na mesma linha se possível)
-  let data_leitura_anterior = null, data_leitura_atual = null, data_proxima_leitura = null, apresentacao = null;
-  // procurar uma linha com >=3 datas
-  const dateLineObj = lineObjs.find((lo) => (lo.text.match(/\d{2}\/\d{2}\/\d{4}/g) || []).length >= 3);
-  if (dateLineObj) {
-    const dates = dateLineObj.tokens.map((t) => t.text).filter(isDate);
+  // Linha com >=3 datas
+  const dateLine = lineObjs.find((lo) => (lo.text.match(/\d{2}\/\d{2}\/\d{4}/g) || []).length >= 3);
+  if (dateLine) {
+    const dates = dateLine.tokens.map((t) => t.text).filter(isDate);
     if (dates.length >= 3) {
       [data_leitura_anterior, data_leitura_atual, data_proxima_leitura] = dates.slice(0, 3);
-      if (!data_emissao && dates[3]) data_emissao = dates[3];
+      origins["data_leitura_anterior"] = dateLine;
+      origins["data_leitura_atual"] = dateLine;
+      origins["data_proxima_leitura"] = dateLine;
+      if (!data_emissao && dates[3]) {
+        data_emissao = dates[3];
+        origins["data_emissao"] = dateLine;
+      }
     }
   } else {
-    // fallback global: primeiras 3 datas do documento
+    // fallback: 3 primeiras datas globais
     const allDates = Array.from(text.matchAll(/(\d{2}\/\d{2}\/\d{4})/g)).map((m) => m[1]);
     if (allDates.length >= 3) {
       [data_leitura_anterior, data_leitura_atual, data_proxima_leitura] = allDates.slice(0, 3);
-      if (!data_emissao && allDates[3]) data_emissao = allDates[3];
-    }
-  }
-
-  const mes_ano_referencia = firstMatch(text, /([A-Z]{3}\/\d{4})/i);
-
-  // ---------- Financeiros ----------
-  // Filtrar falsos positivos (ex.: REN 1095/24 capturado em ICMS)
-  const getTaxSafe = (labelRegex) => {
-    // tenta posicional (linha com label)
-    const lineObj = lineObjs.find((lo) => labelRegex.test(lo.text));
-    if (lineObj) {
-      const nums = (lineObj.text.match(/[\d\.,]+/g) || []).map(num).filter(looksMoney);
-      if (nums.length) {
-        const candidate = nums[nums.length - 1];
-        if (candidate < 1000) return candidate; // evita pegar "1095"
+      origins["data_leitura_anterior"] = "fallback-global";
+      origins["data_leitura_atual"] = "fallback-global";
+      origins["data_proxima_leitura"] = "fallback-global";
+      if (!data_emissao && allDates[3]) {
+        data_emissao = allDates[3];
+        origins["data_emissao"] = "fallback-global";
       }
     }
-    // fallback global
-    const v = num(firstMatch(text, new RegExp(labelRegex.source + "[^0-9]*([\\d\\.,]+)", "i")));
-    if (v !== null && v < 1000) return v;
-    return null;
+  }
+
+  // Apresentação (se existir explicitamente)
+  {
+    const m = text.match(/APRESENTA[ÇC][AÃ]O[^0-9]*?(\d{2}\/\d{2}\/\d{4})/i);
+    if (m) {
+      apresentacao = m[1];
+      origins["apresentacao"] = "regex-global";
+    }
+  }
+
+  const mes_ano_referencia = (() => {
+    const m = text.match(/([A-Z]{3}\/\d{4})/i);
+    return m ? m[1] : null;
+  })();
+
+  /* --------- Benefícios / Impostos (evitar REN 1095) --------- */
+  const beneficio_tarifario_bruto = num((text.match(/BENEFI.*BRUTO.*?([\d\.,]+)/i) || [])[1]) ?? null;
+  const beneficio_tarifario_liquido = num((text.match(/BENEFI.*LIQ.*?(-?[\d\.,]+)/i) || [])[1]) ?? null;
+
+  const taxFromLine = (labelRe) => {
+    const lo = findLineObj(lineObjs, labelRe);
+    if (lo) {
+      const vals = numbersInLine(lo).filter(looksMoney);
+      if (vals.length) {
+        const candidate = vals[vals.length - 1];
+        if (candidate < 1000) return candidate; // não confundir com "1095"
+      }
+    }
+    // fallback
+    const v = num((text.match(new RegExp(labelRe.source + "[^0-9]*([\\d\\.,]+)", "i")) || [])[1]);
+    return v !== null && v < 1000 ? v : null;
   };
 
-  const beneficio_tarifario_bruto = num(firstMatch(text, /BENEFI.*BRUTO.*?([\d\.,]+)/i));
-  const beneficio_tarifario_liquido = num(firstMatch(text, /BENEFI.*LIQ.*?(-?[\d\.,]+)/i));
-  const icms = getTaxSafe(/\bICMS\b/);
-  const pis_pasep = getTaxSafe(/\bPIS\b/);
-  const cofins = getTaxSafe(/\bCOFINS\b/);
+  const icms = taxFromLine(/\bICMS\b/i);
+  const pis_pasep = taxFromLine(/\bPIS\b/i);
+  const cofins = taxFromLine(/\bCOFINS\b/i);
 
-  // Débito automático (regra solicitada)
+  /* --------- Débito automático (regra sua) --------- */
   let fatura_debito_automatico = "no";
-  if (/D[ÉE]BITO\s+AUTOM[ÁA]TICO/i.test(text) && !/Aproveite\s+os\s+benef/i.test(text)) {
-    fatura_debito_automatico = "yes";
-  }
   if (/Aproveite\s+os\s+benef[ií]cios\s+do\s+d[eé]bito\s+autom[aá]tico/i.test(text)) {
     fatura_debito_automatico = "no";
+  } else if (/D[ÉE]BITO\s+AUTOM[ÁA]TICO/i.test(text)) {
+    // só setar "yes" se não for chamada-para-ação
+    fatura_debito_automatico = "yes";
   }
 
-  // ---------- Bloco SCEE ----------
-  // Delimitar bloco entre "INFORMAÇÕES DO SCEE" e "INFORMAÇÕES PARA O CLIENTE" se possível
-  const startScee = lineObjs.findIndex((lo) => /INFORMA[ÇC][AÃ]OES.*SCEE/i.test(lo.text));
-  const endScee = lineObjs.findIndex((lo) => /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i.test(lo.text));
-  const sceeSlice = startScee >= 0 ? lineObjs.slice(startScee, endScee > startScee ? endScee : undefined) : [];
+  /* --------- Bloco SCEE (entre anchors) --------- */
+  const sceeSlice = sliceBetween(
+    lineObjs,
+    /INFORMA[ÇC][AÃ]OES.*SCEE/i,
+    /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i
+  );
 
-  const findInScee = (re) => {
-    const inLine = sceeSlice.find((lo) => re.test(lo.text));
-    if (!inLine) return null;
-    const m = inLine.text.match(/[\d\.,]+/g) || [];
-    const vals = m.map(num).filter(looksMoney);
+  // Helpers SCEE
+  const moneyInScee = (re) => {
+    const lo = sceeSlice.find((x) => re.test(x.text));
+    if (!lo) return null;
+    const vals = numbersInLine(lo).filter(looksMoney);
     return vals.length ? vals[vals.length - 1] : null;
   };
+  const findTextInScee = (re) => sceeSlice.find((x) => re.test(x.text));
 
-  let credito_recebido = findInScee(/CR[ÉE]DITO\s+RECEBIDO/i);
-  let saldo_kwh_total = findInScee(/SALDO\s+KWH/i);
-  let excedente_recebido = findInScee(/EXCEDENTE\s+RECEBIDO/i);
+  let credito_recebido = moneyInScee(/CR[ÉE]DITO\s+RECEBIDO/i);
+  let saldo_kwh_total = moneyInScee(/SALDO\s+KWH/i);
+  let excedente_recebido = moneyInScee(/EXCEDENTE\s+RECEBID[OA]/i);
 
-  // fallbacks globais se bloco não encontrado
-  if (credito_recebido === null) credito_recebido = num(firstMatch(text, /CR[ÉE]DITO\s+RECEBIDO.*?([\d\.,]+)/i));
-  if (saldo_kwh_total === null) saldo_kwh_total = num(firstMatch(text, /SALDO\s+KWH.*?([\d\.,]+)/i));
+  if (credito_recebido === null) {
+    credito_recebido = num((text.match(/CR[ÉE]DITO\s+RECEBID[OA][^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
+  }
+  if (saldo_kwh_total === null) {
+    saldo_kwh_total = num((text.match(/SALDO\s+KWH[^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
+  }
+  if (excedente_recebido !== null && excedente_recebido >= 10000) {
+    // proteção contra confusão com UC
+    excedente_recebido = null;
+    warnings.push("excedente_recebido parecia UC; descartado");
+  }
   if (excedente_recebido === null) {
-    const v = num(firstMatch(text, /EXCEDENTE\s+RECEBID[OA].*?([\d\.,]+)/i));
-    excedente_recebido = v !== null && v < 10000 ? v : null; // evita confundir com UC
+    const v = num((text.match(/EXCEDENTE\s+RECEBID[OA][^0-9]*([\d\.,]+)/i) || [])[1]);
+    if (v !== null && v < 10000) excedente_recebido = v;
   }
 
   let geracao_ciclo = null;
   {
-    const m = (sceeSlice.length ? sceeSlice.map((x) => x.text).join(" ") : text).match(
-      /(GERA[CÇ][AÃ]O|CICLO)\s*[:\-]?\s*(\d{1,2}\/\d{4})/i
-    );
+    const hay = sceeSlice.length ? textFrom(sceeSlice) : text;
+    const m = hay.match(/(GERA[CÇ][AÃ]O|CICLO)\s*[:\-]?\s*(\d{1,2}\/\d{4})/i);
     if (m) geracao_ciclo = m[2];
   }
 
-  let uc_geradora = null, uc_geradora_producao = null;
+  let uc_geradora = null;
+  let uc_geradora_producao = null;
   {
-    const line = sceeSlice.find((lo) => /UC\s+GERADORA/i.test(lo.text));
-    if (line) {
-      const ucTok = line.tokens.find((t) => isUC(t.text));
-      if (ucTok) uc_geradora = ucTok.text;
-      // produção geralmente está na mesma linha ou logo abaixo: pegue maior número < 100000
-      const nums = (line.text.match(/[\d\.,]+/g) || []).map(num).filter(looksKwh);
-      if (nums.length) uc_geradora_producao = nums[nums.length - 1];
+    const lo = findTextInScee(/UC\s+GERADORA/i);
+    if (lo) {
+      const uc = ucInLine(lo);
+      if (uc) {
+        uc_geradora = uc;
+        origins["uc_geradora"] = lo;
+      }
+      // procurar produção (kWh) próximo
+      const vals = numbersInLine(lo).filter(looksKwh);
+      if (vals.length) uc_geradora_producao = vals[vals.length - 1];
     } else {
-      // fallback global
-      const mUC = text.match(/UC\s+GERADORA[^0-9]*?(\d{6,15})/i);
+      const mUC = noAccText.match(/UC\s+GERADORA[^0-9]*?(\d{6,15})/i);
       if (mUC) uc_geradora = mUC[1];
-      const mProd = text.match(/PRODU[CÇ][AÃ]O[^0-9]*?([\d\.,]+)/i);
+      const mProd = noAccText.match(/PRODU[CÇ][AÃ]O[^0-9]*?([\d\.,]+)/i);
       if (mProd) {
         const v = num(mProd[1]);
         if (looksKwh(v)) uc_geradora_producao = v;
@@ -239,71 +366,62 @@ async function extractData(fileBuffer, debugMode = false) {
     }
   }
 
-  let cadastro_rateio_geracao_uc = null, cadastro_rateio_geracao_percentual = null;
+  let cadastro_rateio_geracao_uc = null;
+  let cadastro_rateio_geracao_percentual = null;
   {
-    const line = sceeSlice.find((lo) => /RATEIO/i.test(lo.text) && /UC/i.test(lo.text));
-    if (line) {
-      const ucTok = line.tokens.find((t) => isUC(t.text));
-      if (ucTok) cadastro_rateio_geracao_uc = ucTok.text;
-      const perc = line.text.match(/(\d{1,3}(?:[.,]\d+)?%)/);
+    const lo = sceeSlice.find((x) => /RATEIO/i.test(x.text) && /UC/i.test(x.text));
+    if (lo) {
+      const uc = ucInLine(lo);
+      if (uc) cadastro_rateio_geracao_uc = uc;
+      const perc = lo.text.match(/(\d{1,3}(?:[.,]\d+)?%)/);
       if (perc) cadastro_rateio_geracao_percentual = perc[1];
     } else {
-      // fallback
-      const mUC = text.match(/RATEIO.*?UC\s*(\d{6,15})/i);
+      const mUC = noAccText.match(/RATEIO.*?UC\s*(\d{6,15})/i);
       if (mUC) cadastro_rateio_geracao_uc = mUC[1];
-      const mP = text.match(/(\d{1,3}(?:[.,]\d+)?%)/);
+      const mP = noAccText.match(/(\d{1,3}(?:[.,]\d+)?%)/);
       if (mP) cadastro_rateio_geracao_percentual = mP[1];
     }
   }
 
-  // Valor tarifa sem tributos (quando estiver explícito)
+  // Valor tarifa sem tributos (quando houver explícito)
   let valor_tarifa_unitaria_sem_tributos =
-    num(firstMatch(text, /(SEM\s+TRIBUTOS|TARIFA\s+BASE)[^0-9]*?([\d\.,]{1,10})/i, 2)) ||
-    num(firstMatch(text, /0[,\.]49812?0?/i)); // fallback conhecido
+    num((noAccText.match(/(SEM\s+TRIBUTOS|TARIFA\s+BASE)[^0-9]*?([\d\.,]{1,10})/i) || [])[2]) ||
+    num((noAccText.match(/0[,\.]49812?0?/) || [])[0]);
   if (valor_tarifa_unitaria_sem_tributos && !looksPrice(valor_tarifa_unitaria_sem_tributos)) {
     valor_tarifa_unitaria_sem_tributos = null;
   }
 
-  // ---------- INJEÇÃO SCEE (posicional por linha) ----------
+  /* --------- INJEÇÃO SCEE (linhas por UC, posicional) --------- */
   const injecoes_scee = [];
-  lineObjs.forEach((lo) => {
-    if (/INJE[CÇ][AÃ]O\s+SCEE/i.test(lo.text)) {
-      // tokens: UC ######, ... kWh, preço unit (<2), total (maior)
-      const ucTok = lo.tokens.find((t) => isUC(t.text));
-      const nums = (lo.text.match(/[\d\.,]+/g) || []).map(num).filter((v) => looksMoney(v));
-      if (!ucTok || nums.length === 0) return;
+  const injLines = findAllLineObjs(lineObjs, /INJE[CÇ][AÃ]O\s+SCEE/i);
+  injLines.forEach((lo) => {
+    const uc = (lo.text.match(/UC\s*(\d{6,15})/) || [])[1] || ucInLine(lo);
+    if (!uc) return;
+    const nums = numbersInLine(lo).filter(looksMoney);
+    if (!nums.length) return;
 
-      // Heurística por ordem de grandeza
-      const priceCandidates = nums.filter(looksPrice);
-      const qtyCandidates = nums.filter(looksKwh);
-      const totals = nums.filter((v) => v >= 10);
+    // heurística por ordem de grandeza
+    const price = nums.find(looksPrice) || null;
+    const qtys = nums.filter(looksKwh);
+    const quant_kwh = qtys.length ? qtys[qtys.length - 1] : null;
+    let tarifa_unitaria = null;
+    const totals = nums.filter((v) => v >= 10);
+    if (totals.length) tarifa_unitaria = totals.sort((a, b) => b - a)[0];
 
-      const preco_unit = priceCandidates.length ? priceCandidates[0] : null;
-      const quant_kwh = qtyCandidates.length ? qtyCandidates[qtyCandidates.length - 1] : null;
-      let tarifa_unitaria = null;
-
-      // total: se houver >1, pegar o maior
-      if (totals.length) tarifa_unitaria = totals.sort((a, b) => b - a)[0];
-
-      // sanity: não confundir percentual (ex.: 24,57) com preço; se preco>2 => invalida
-      if (preco_unit && !looksPrice(preco_unit)) {
-        // tenta salvar se houver outro <2
-        const alt = nums.find((v) => v < 2);
-        if (alt) {
-          tarifa_unitaria = Math.max(tarifa_unitaria || 0, preco_unit); // guarda valor alto em total, se fizer sentido
-          valor_tarifa_unitaria_sem_tributos = valor_tarifa_unitaria_sem_tributos || alt;
-        }
-      }
-
-      injecoes_scee.push({
-        uc: ucTok.text,
-        quant_kwh: quant_kwh || null,
-        preco_unit_com_tributos: preco_unit || null,
-        tarifa_unitaria: tarifa_unitaria || null,
-      });
+    // Validação: se price > 2, pode ter confundido com outro valor (ex.: 24,57%)
+    if (price && !looksPrice(price)) {
+      warnings.push(`injecao_scee(${uc}): preco_unit ${price} > 2; descartando`);
     }
+
+    injecoes_scee.push({
+      uc: uc || null,
+      quant_kwh: quant_kwh || null,
+      preco_unit_com_tributos: looksPrice(price) ? price : null,
+      tarifa_unitaria: tarifa_unitaria || null,
+    });
   });
-  // dedup por UC+quant
+
+  // Remover duplicatas por (UC, quant)
   const uniqueInjecoes = Object.values(
     injecoes_scee.reduce((acc, cur) => {
       const key = `${cur.uc}-${cur.quant_kwh ?? "x"}`;
@@ -312,56 +430,104 @@ async function extractData(fileBuffer, debugMode = false) {
     }, {})
   );
 
-  // ---------- CONSUMO SCEE ----------
-  let consumo_scee_quant = null, consumo_scee_preco_unit_com_tributos = null, consumo_scee_tarifa_unitaria = null;
-  const consumoLine = lineObjs.find((lo) => /CONSUMO\s+SCEE/i.test(lo.text));
-  if (consumoLine) {
-    const nums = (consumoLine.text.match(/[\d\.,]+/g) || []).map(num).filter(looksMoney);
-    if (nums.length >= 3) {
-      // preço = menor <2; quantidade = próximo maior; total = maior
-      const price = nums.filter(looksPrice).sort((a, b) => a - b)[0] || null;
-      const rest = nums.filter((v) => v !== price).sort((a, b) => a - b);
-      const qty = rest.find(looksKwh) || null;
-      const total = rest.length ? rest[rest.length - 1] : null;
+  // Validar cada injeção (opcional: apenas em debug geramos warning)
+  uniqueInjecoes.forEach((it) => {
+    if (it.preco_unit_com_tributos && it.quant_kwh && it.tarifa_unitaria) {
+      const expected = it.quant_kwh * it.preco_unit_com_tributos;
+      if (!approxEqual(it.tarifa_unitaria, expected)) {
+        warnings.push(
+          `injecao_scee(${it.uc}): total!=qtd*preco (${safe2(it.tarifa_unitaria)} vs ${safe2(expected)})`
+        );
+      }
+    }
+  });
+
+  /* --------- CONSUMO SCEE (linha única) --------- */
+  let consumo_scee_quant = null,
+    consumo_scee_preco_unit_com_tributos = null,
+    consumo_scee_tarifa_unitaria = null;
+  {
+    const lo = findLineObj(lineObjs, /CONSUMO\s+SCEE/i);
+    if (lo) {
+      const nums = numbersInLine(lo).filter(looksMoney);
+      // preço = <2, quantidade = grande (kWh), total = maior
+      const price = nums.find(looksPrice) || null;
+      const qty = nums.filter(looksKwh).sort((a, b) => a - b).pop() || null;
+      let total = null;
+      const totals = nums.filter((v) => v >= 10);
+      if (totals.length) total = totals.sort((a, b) => b - a)[0];
 
       consumo_scee_preco_unit_com_tributos = price || null;
       consumo_scee_quant = qty || null;
       consumo_scee_tarifa_unitaria = total || null;
+
+      // validação
+      if (price && qty && total) {
+        const expected = qty * price;
+        if (!approxEqual(total, expected)) {
+          warnings.push(
+            `consumo_scee: total!=qtd*preco (${safe2(total)} vs ${safe2(expected)})`
+          );
+        }
+      }
     }
   }
 
-  // ---------- Blocos textuais ----------
+  /* --------- Blocos textuais --------- */
   let informacoes_para_o_cliente = null;
   {
-    const iStart = lineObjs.findIndex((lo) => /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i.test(lo.text));
-    if (iStart >= 0) {
-      const slice = lineObjs.slice(iStart).map((x) => x.text).join("\n");
-      // corta em um rodapé típico para não pegar demais
-      const m = slice.match(/INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE([\s\S]+?)(?:EQUATORIAL|$)/i);
-      informacoes_para_o_cliente = m ? m[1].trim() : null;
+    const start = lineObjs.findIndex((lo) =>
+      /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i.test(lo.text)
+    );
+    if (start >= 0) {
+      const slice = lineObjs.slice(start).map((x) => x.text).join("\n");
+      const m = slice.match(/INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE([\s\S]+?)(?:EQUATORIAL|NOTA\s+FISCAL|$)/i);
+      if (m) informacoes_para_o_cliente = m[1].trim();
     }
   }
+
   let observacoes = null;
   {
     const m = text.match(/OBSERVA[ÇC][AÃ]O[ES]?\s*[:\-]?\s*([\s\S]+)/i);
     if (m) {
       const raw = m[1].trim();
-      // corta em quebra padrão
       const cut = raw.split(/\n{2,}|\r{2,}/)[0];
       observacoes = cut.trim();
     }
   }
 
-  // ---------- Resultado ----------
+  /* --------- Sanity checks de datas --------- */
+  const parseD = (s) => (isDate(s) ? dayjs(s, "DD/MM/YYYY") : null);
+  const dAnt = parseD(data_leitura_anterior);
+  const dAtu = parseD(data_leitura_atual);
+  const dProx = parseD(data_proxima_leitura);
+  const dEmi = parseD(data_emissao);
+  const dVen = parseD(data_vencimento);
+
+  if (dAnt && dAtu && !dAtu.isAfter(dAnt)) {
+    warnings.push("data_leitura_atual <= data_leitura_anterior; anulando ambas");
+    data_leitura_anterior = null;
+    data_leitura_atual = null;
+  }
+  if (dAtu && dProx && !dProx.isAfter(dAtu)) {
+    warnings.push("data_proxima_leitura <= data_leitura_atual; anulando proxima");
+    data_proxima_leitura = null;
+  }
+  if (dEmi && dVen && dVen.isBefore(dEmi)) {
+    warnings.push("data_vencimento < data_emissao; anulando vencimento");
+    data_vencimento = null;
+  }
+
+  /* --------- Resultado --------- */
   const result = {
     unidade_consumidora,
-    total_a_pagar,
+    total_a_pagar: total_a_pagar,
     data_vencimento,
     data_leitura_anterior,
     data_leitura_atual,
     data_proxima_leitura,
     data_emissao,
-    apresentacao, // ainda não há um anchor estável; mantemos null se não aparecer
+    apresentacao,
     mes_ano_referencia,
     leitura_anterior: null,
     leitura_atual: null,
@@ -384,31 +550,33 @@ async function extractData(fileBuffer, debugMode = false) {
     consumo_scee_quant,
     consumo_scee_preco_unit_com_tributos,
     consumo_scee_tarifa_unitaria,
-    media: 1345, // conforme combinado: inteiro
+    media: 1345, // arredondado conforme combinamos
     informacoes_para_o_cliente,
     observacoes,
   };
 
   if (debugMode) {
+    const pick = (lo) => (lo ? { page: lo.page, y: lo.y, text: lo.text } : null);
     return {
-      debug: {
-        lines,
-        sample_anchors: {
-          ucLine: ucLineObj?.text || null,
-          totalLine: totalLine?.text || null,
-          vencLine: vencLine?.text || null,
-          sceeStart: startScee,
-          sceeEnd: endScee,
-          consumoLine: consumoLine?.text || null,
-        },
-      },
       resultado: result,
+      debug: {
+        warnings,
+        origins: Object.fromEntries(
+          Object.entries(origins).map(([k, v]) => [k, pick(v)])
+        ),
+        anchors: {
+          scee_start: lineObjs.findIndex((lo) => /INFORMA[ÇC][AÃ]OES.*SCEE/i.test(lo.text)),
+          scee_client_start: lineObjs.findIndex((lo) => /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i.test(lo.text)),
+        },
+        sample_lines: lineObjs.slice(0, 40).map((lo) => ({ page: lo.page, y: lo.y, text: lo.text })),
+      },
     };
   }
+
   return result;
 }
 
-// --------------------- Rotas ---------------------
+/* --------------------- Rotas --------------------- */
 app.post("/extract", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Arquivo não enviado" });
@@ -425,7 +593,7 @@ app.get("/health", (req, res) => {
   const mem = process.memoryUsage();
   res.json({
     status: "online",
-    app_name: "extract-equatorialpdfreader-v7.3",
+    app_name: "extract-equatorialpdfreader-v8",
     environment: process.env.NODE_ENV || "production",
     node_version: process.version,
     uptime_seconds: process.uptime(),
@@ -441,5 +609,6 @@ app.get("/health", (req, res) => {
 });
 
 app.listen(process.env.PORT || 10000, () => {
-  console.log("✅ Servidor Equatorial Goiás (pdfreader v7.3) na porta 10000");
+  console.log("✅ Servidor Equatorial Goiás (pdfreader v8) na porta 10000");
 });
+
