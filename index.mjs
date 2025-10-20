@@ -32,6 +32,15 @@
 // - Validação matemática: total ≈ qtd × preço (tolerância 0,5%)
 // - Reconstrução "Informações para o Cliente"
 // =====================================================
+// =====================================================
+// index.mjs v9.3.2 – Equatorial Goiás       20/10/2025  08:54
+// Revisões solicitadas:
+// - Removido limite de total a pagar (sem cap).
+// - Datas: 1ª linha = leituras; 2ª linha = vencimento (+ emissão se houver).
+// - Impostos: sem piso; sempre último número sem %.
+// - Preços tarifários: priorizar 6 casas decimais (depois 5).
+// - Informações p/ Cliente & Observações: extração por “caixa” (âncora → próximo cabeçalho).
+// =====================================================
 import express from "express";
 import multer from "multer";
 import { PdfReader } from "pdfreader";
@@ -64,12 +73,7 @@ const approxEqual = (a, b, tol = 0.005) => {
   return r <= tol;
 };
 
-/* ----------------- PDF → linhas normalizadas ----------------- */
-// 1) Lemos tokens com (page,x,y,text)
-// 2) Agrupamos por página; calculamos min/max para normalizar x/y → [0..1]
-// 3) Bucketizamos por y (tolerância) para formar linhas estáveis (left→right)
-// 4) Pré-process: juntar artefatos ("R $", "R$******") → normalizar
-
+/* ---------- PDF → linhas normalizadas (com pré-process) ---------- */
 async function readPdfTokens(buffer) {
   return new Promise((resolve, reject) => {
     const reader = new PdfReader();
@@ -81,9 +85,6 @@ async function readPdfTokens(buffer) {
       if (item.page) page = item.page;
       if (item.text) {
         let t = (item.text || "").trim();
-        // normaliza casos comuns
-        if (t === "R") t = "R"; // manter
-        if (t === "$") t = "$"; // manter
         tokens.push({ page, x: item.x, y: item.y, text: t });
       }
     });
@@ -126,24 +127,23 @@ function buildNormalizedLines(tokens) {
       rows[bucket].push(tk);
     }
 
-    // compõe linhas, ordenando tokens por nx
+    // compõe linhas, ordenando tokens por nx e unindo "R" + "$"
     const yKeys = Object.keys(rows).map(parseFloat).sort((a, b) => a - b);
     for (const yk of yKeys) {
       let toks = rows[yk.toFixed(4)].sort((a, b) => a.nx - b.nx);
 
-      // PRÉ-PROCESS: unir "R" seguido de "$" em "R$"
+      // unir "R" seguido de "$" em "R$"
       const merged = [];
       for (let i = 0; i < toks.length; i++) {
         const cur = toks[i];
         const nxt = toks[i + 1];
         if (cur && nxt && cur.text === "R" && nxt.text === "$" && Math.abs(cur.nx - nxt.nx) < 0.02) {
           merged.push({ ...cur, text: "R$" });
-          i++; // pula o $
+          i++;
         } else {
           merged.push(cur);
         }
       }
-
       toks = merged;
 
       const text = toks.map((t) => t.text).join(" ").replace(/R\$\s*\*+/g, "R$").trim();
@@ -161,22 +161,34 @@ const findLine = (lines, re) => lines.find((l) => re.test(l.text));
 const findAll = (lines, re) => lines.filter((l) => re.test(l.text));
 const textAll = (lines) => lines.map((l) => l.text).join("\n");
 
-/* ----------------- Extração por âncora/visinhança ----------------- */
-const lastMoneyInLine = (line) => {
-  const nums = (line.text.match(/[\d\.,]+/g) || [])
-    .filter((s) => !/%/.test(s))
-    .map(num)
-    .filter(looksMoney);
-  return nums.length ? nums[nums.length - 1] : null;
-};
+/* ----------------- Box extractor (âncora → próximo cabeçalho) ----------------- */
+function extractBox(lines, startRe, stopRes = [], maxLookahead = 120) {
+  const startIdx = lines.findIndex((l) => startRe.test(stripAccents(l.text)));
+  if (startIdx < 0) return null;
+  let buff = [];
+  for (let i = startIdx + 1; i < Math.min(lines.length, startIdx + 1 + maxLookahead); i++) {
+    const txt = stripAccents(lines[i].text);
+    const hitsStop = stopRes.some((re) => re.test(txt));
+    if (hitsStop) break;
+    buff.push(lines[i].text);
+  }
+  const joined = buff.join("\n").replace(/\s{2,}/g, " ").trim();
+  return joined || null;
+}
 
-const dateRightOf = (line) => {
-  if (!line) return null;
-  const m = line.text.match(/(\d{2}\/\d{2}\/\d{4})/);
-  return m ? m[1] : null;
-};
+/* ----------------- Preferência por 6 casas decimais (<2) ----------------- */
+function pickPriceToken(tokensArr) {
+  // tenta 6 casas
+  const six = tokensArr.find((o) => looksPrice(o.v) && /\d[.,]\d{6}$/.test(o.v.toString().replace(".", ",")));
+  if (six) return six;
+  // tenta 5 casas
+  const five = tokensArr.find((o) => looksPrice(o.v) && /\d[.,]\d{5}$/.test(o.v.toString().replace(".", ",")));
+  if (five) return five;
+  // qualquer < 2
+  return tokensArr.find((o) => looksPrice(o.v)) || null;
+}
 
-/* ----------------- Core extraction (v9.3) ----------------- */
+/* ----------------- Core extraction (v9.3.2) ----------------- */
 async function extractData(buffer, debugMode = false) {
   const rawTokens = await readPdfTokens(buffer);
   const lines = buildNormalizedLines(rawTokens);
@@ -185,78 +197,100 @@ async function extractData(buffer, debugMode = false) {
 
   const debug = { origins: {}, warnings: [] };
   const setOrigin = (field, line) => {
-    if (line) debug.origins[field] = { page: line.page, ny: Number(line.ny.toFixed(4)), text: line.text };
+    if (line) debug.origins[field] = { page: line.page, ny: Number(line.ny?.toFixed?.(4) ?? 0), text: line.text };
   };
 
-  /* 1) Unidade Consumidora (âncora, evita UC GERADORA) */
+  /* 1) Unidade Consumidora (âncora; evita CEP/endereço e UC GERADORA) */
   let unidade_consumidora = null;
   {
     const lo = findLine(lines, /UNID.*CONSUM/i);
     if (lo) {
-      const ucTok = lo.tokens.find((t) => isUC(t.text));
-      if (ucTok) { unidade_consumidora = ucTok.text; setOrigin("unidade_consumidora", lo); }
+      const pageLines = lines.filter((l) => l.page === lo.page);
+      const startIdx = pageLines.findIndex((l) => l.ny === lo.ny);
+      const windowLines = pageLines.slice(startIdx, startIdx + 3); // mesma linha + 2 abaixo
+
+      for (const ln of windowLines) {
+        if (/CEP/i.test(ln.text) || /(RUA|AVENIDA|ALAMEDA|QD\.?|QUADRA|LOTE|BAIRRO|CEP)/i.test(ln.text)) continue;
+        if (/UC\s+GERADORA/i.test(ln.text)) continue;
+        const m = ln.text.match(/\b(\d{6,15})\b/);
+        if (m && !/^74\d{6}$/.test(m[1])) { unidade_consumidora = m[1]; setOrigin("unidade_consumidora", ln); break; }
+      }
     }
     if (!unidade_consumidora) {
-      // fallback cauteloso: procurar na mesma página do cabeçalho (onde aparece REF)
       const ref = findLine(lines, /[A-Z]{3}\/\d{4}/i);
       if (ref) {
         const pageLines = lines.filter((l) => l.page === ref.page);
         for (const l of pageLines) {
           if (/UC\s+GERADORA/i.test(l.text)) continue;
+          if (/CEP/i.test(l.text) || /(RUA|AVENIDA|ALAMEDA|QD\.?|QUADRA|LOTE|BAIRRO|CEP)/i.test(l.text)) continue;
           const m = l.text.match(/\b(\d{6,15})\b/);
-          if (m) { unidade_consumidora = m[1]; setOrigin("unidade_consumidora", l); break; }
+          if (m && !/^74\d{6}$/.test(m[1])) { unidade_consumidora = m[1]; setOrigin("unidade_consumidora", l); break; }
         }
       }
     }
   }
 
-  /* 2) TOTAL A PAGAR + VENCIMENTO (linha com R$ e data; limpar asteriscos) */
+  /* 2) TOTAL A PAGAR + VENCIMENTO (sem cap; concat linhas vizinhas se preciso) */
   let total_a_pagar = null, data_vencimento = null;
   {
-    const payLine = lines.find((l) => /R\$\s*[\*\d\.,]+\s+\d{2}\/\d{2}\/\d{4}/.test(l.text.replace(/\*/g, "")));
+    let payLine = lines.find((l) => /R\$\s*[\*\d\.,]+\s+\d{2}\/\d{2}\/\d{4}/.test(l.text.replace(/\*/g, "")));
+
+    if (!payLine) {
+      for (let i = 0; i < lines.length - 1; i++) {
+        if (lines[i].page !== lines[i + 1].page) continue;
+        if (Math.abs(lines[i].ny - lines[i + 1].ny) <= 0.002) {
+          const combo = (lines[i].text + " " + lines[i + 1].text).replace(/\*/g, "");
+          if (/R\$\s*[\d\.,]+\s+\d{2}\/\d{2}\/\d{4}/.test(combo)) {
+            payLine = { ...lines[i], text: combo };
+            break;
+          }
+        }
+      }
+    }
+
     if (payLine) {
       const clean = payLine.text.replace(/\*/g, "");
       const mV = clean.match(/R\$\s*([\d\.,]+)/);
       const mD = clean.match(/(\d{2}\/\d{2}\/\d{4})/);
-      if (mV) total_a_pagar = num(mV[1]);
+      if (mV) total_a_pagar = safe2(num(mV[1]));
       if (mD) data_vencimento = mD[1];
       setOrigin("total_a_pagar", payLine);
       setOrigin("data_vencimento", payLine);
     } else {
-      // fallback: linha "TOTAL A PAGAR"
       const totLbl = findLine(lines, /TOTAL\s*A\s*PAGAR/i);
-      if (totLbl) { total_a_pagar = lastMoneyInLine(totLbl); setOrigin("total_a_pagar", totLbl); }
+      if (totLbl) { total_a_pagar = safe2((totLbl.text.match(/([\d\.,]+)(?!.*[\d\.,]+)/)?.[1] ? num(totLbl.text.match(/([\d\.,]+)(?!.*[\d\.,]+)/)[1]) : null)); setOrigin("total_a_pagar", totLbl); }
       const venLbl = findLine(lines, /VENC[IMEN]{3,10}/i);
-      if (venLbl) { data_vencimento = dateRightOf(venLbl); setOrigin("data_vencimento", venLbl); }
-    }
-    if (total_a_pagar !== null) total_a_pagar = safe2(total_a_pagar);
-    if (total_a_pagar !== null && !(total_a_pagar >= 10 && total_a_pagar < 5000)) {
-      debug.warnings.push(`total_a_pagar fora do intervalo esperado: ${total_a_pagar}`);
+      if (venLbl) { const d = venLbl.text.match(/(\d{2}\/\d{2}\/\d{4})/); if (d) data_vencimento = d[1]; setOrigin("data_vencimento", venLbl); }
     }
   }
 
-  /* 3) Datas de leitura (linha com 3 datas) + emissão */
+  /* 3) Datas: 1ª linha com 3+ datas = leituras; 2ª linha próxima = vencimento (+ emissão) */
   let data_leitura_anterior = null, data_leitura_atual = null, data_proxima_leitura = null, data_emissao = null;
   {
-    const candidates = findAll(lines, /(\d{2}\/\d{2}\/\d{4}.*){3,}/);
-    if (candidates.length) {
-      // pega a primeira com 3+ datas para leituras
-      const threeDates = candidates[0];
-      const ds = (threeDates.text.match(/\d{2}\/\d{2}\/\d{4}/g) || []);
+    const manyDateLines = lines.filter((l) => (l.text.match(/\d{2}\/\d{2}\/\d{4}/g) || []).length >= 3);
+    if (manyDateLines.length) {
+      // Ordenar por página, depois por proximidade vertical
+      manyDateLines.sort((a, b) => (a.page - b.page) || (a.ny - b.ny));
+      const first = manyDateLines[0];
+      const ds = (first.text.match(/\d{2}\/\d{2}\/\d{4}/g) || []);
       [data_leitura_anterior, data_leitura_atual, data_proxima_leitura] = ds.slice(0, 3);
-      setOrigin("data_leitura_anterior", threeDates);
-      setOrigin("data_leitura_atual", threeDates);
-      setOrigin("data_proxima_leitura", threeDates);
-      // emissão pode aparecer na sequência seguinte
-      const next = candidates[1];
-      if (next) {
-        const dsn = (next.text.match(/\d{2}\/\d{2}\/\d{4}/g) || []);
-        if (dsn.length) { data_emissao = dsn[dsn.length - 1]; setOrigin("data_emissao", next); }
+      setOrigin("data_leitura_anterior", first);
+      setOrigin("data_leitura_atual", first);
+      setOrigin("data_proxima_leitura", first);
+
+      // segunda linha (próxima na mesma página e ny próximo)
+      const second = manyDateLines.find((l) => l.page === first.page && Math.abs(l.ny - first.ny) > 0.01 && Math.abs(l.ny - first.ny) < 0.05) || manyDateLines[1];
+      if (second) {
+        const dsn = (second.text.match(/\d{2}\/\d{2}\/\d{4}/g) || []);
+        if (dsn[0]) data_vencimento = dsn[0];
+        if (dsn[1]) data_emissao = dsn[1];
+        setOrigin("data_vencimento", second);
+        if (dsn[1]) setOrigin("data_emissao", second);
       }
     }
     if (!data_emissao) {
       const emiLine = findLine(lines, /EMISS[ÃA]O/i);
-      if (emiLine) { data_emissao = dateRightOf(emiLine); setOrigin("data_emissao", emiLine); }
+      if (emiLine) { const d = emiLine.text.match(/(\d{2}\/\d{2}\/\d{4})/); if (d) data_emissao = d[1]; setOrigin("data_emissao", emiLine); }
     }
   }
   const mes_ano_referencia = (fullText.match(/([A-Z]{3}\/\d{4})/i) || [])[1] || null;
@@ -265,19 +299,20 @@ async function extractData(buffer, debugMode = false) {
   const beneficio_tarifario_bruto = num((fullText.match(/BENEFI.*BRUTO.*?([\d\.,]+)/i) || [])[1]) ?? null;
   const beneficio_tarifario_liquido = num((fullText.match(/BENEFI.*LIQ.*?(-?[\d\.,]+)/i) || [])[1]) ?? null;
 
-  /* 5) Impostos (valor em R$, ignorar %) */
-  const getTax = (labelRe, field) => {
-    const lo = findLine(lines, labelRe);
-    if (!lo) return null;
-    const cleaned = lo.text.replace(/(\d+(?:[.,]\d+)?)\s*%/g, ""); // remove percentuais
-    const m = cleaned.match(/([\d\.,]+)(?!.*[\d\.,]+)/); // último número
-    const v = m ? num(m[1]) : null;
-    if (v !== null && v < 1000) { setOrigin(field, lo); return v; }
+  /* 5) Impostos: último número sem % (sem piso) */
+  function getTaxRobusto(linesArr, label, field) {
+    const candidatas = findAll(linesArr, new RegExp(`\\b${label}\\b`, "i"));
+    for (const lo of candidatas) {
+      const cleaned = lo.text.replace(/(\d+(?:[.,]\d+)?)\s*%/g, ""); // remove percentuais
+      const m = cleaned.match(/([\d\.,]+)(?!.*[\d\.,]+)/); // último número
+      const v = m ? num(m[1]) : null;
+      if (v !== null) { setOrigin(field, lo); return v; }
+    }
     return null;
-  };
-  const icms = getTax(/\bICMS\b/i, "icms");
-  const pis_pasep = getTax(/\bPIS\b/i, "pis_pasep");
-  const cofins = getTax(/\bCOFINS\b/i, "cofins");
+  }
+  const icms = getTaxRobusto(lines, "ICMS", "icms");
+  const pis_pasep = getTaxRobusto(lines, "PIS", "pis_pasep");
+  const cofins = getTaxRobusto(lines, "COFINS", "cofins");
 
   /* 6) Débito automático */
   let fatura_debito_automatico = "no";
@@ -286,35 +321,44 @@ async function extractData(buffer, debugMode = false) {
     fatura_debito_automatico = "yes";
   }
 
-  /* 7) SCEE – Resumo nas ~12 linhas após “INFORMAÇÕES PARA O CLIENTE” */
+  /* 7) SCEE – Resumo (âncora → próximo cabeçalho) */
   let credito_recebido = null, saldo_kwh_total = null, excedente_recebido = null;
   let geracao_ciclo = null, uc_geradora = null, uc_geradora_producao = null;
   let cadastro_rateio_geracao_uc = null, cadastro_rateio_geracao_percentual = null;
 
   {
-    const clientIdx = lines.findIndex((l) => /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i.test(l.text));
-    const slice = clientIdx >= 0 ? lines.slice(clientIdx, clientIdx + 15) : [];
-    const sliceText = slice.map((l) => l.text).join("\n");
+    const box = extractBox(
+      lines,
+      /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i,
+      [
+        /ITENS\s+DE\s+FATURA/i,
+        /NOTA\s+FISCAL/i,
+        /EQUATORIAL/i,
+        /UC\s+GERADORA/i // em alguns layouts vem logo abaixo
+      ],
+      150
+    );
 
-    geracao_ciclo = (sliceText.match(/(\d{1,2}\/\d{4})/) || [])[1] || null;
-    uc_geradora = (sliceText.match(/UC\s+GERADORA[^0-9]*?(\d{6,15})/) || [])[1] || null;
-    uc_geradora_producao = num((sliceText.match(/PRODU[CÇ][AÃ]O[^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
-    excedente_recebido = num((sliceText.match(/EXCEDENTE\s+RECEBID[OA][^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
-    credito_recebido = num((sliceText.match(/CR[ÉE]DITO\s+RECEBID[OA][^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
-    saldo_kwh_total = num((sliceText.match(/SALDO\s+KWH[^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
+    if (box) {
+      geracao_ciclo = (box.match(/(\d{1,2}\/\d{4})/) || [])[1] || null;
+      uc_geradora = (box.match(/UC\s+GERADORA[^0-9]*?(\d{6,15})/) || [])[1] || null;
+      uc_geradora_producao = num((box.match(/PRODU[CÇ][AÃ]O[^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
+      excedente_recebido = num((box.match(/EXCEDENTE\s+RECEBID[OA][^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
+      credito_recebido = num((box.match(/CR[ÉE]DITO\s+RECEBID[OA][^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
+      saldo_kwh_total = num((box.match(/SALDO\s+KWH[^0-9]*([\d\.,]+)/i) || [])[1]) ?? null;
 
-    const rtUC = sliceText.match(/CADASTRO\s+RATEIO\s+GERA[ÇC][AÃ]O[^U]*UC\s*(\d{6,15})/i);
-    const rtP = sliceText.match(/(\d{1,3}(?:[.,]\d+)?%)/);
-    if (rtUC) cadastro_rateio_geracao_uc = rtUC[1];
-    if (rtP) cadastro_rateio_geracao_percentual = rtP[1];
+      const rtUC = box.match(/CADASTRO\s+RATEIO\s+GERA[ÇC][AÃ]O[^U]*UC\s*(\d{6,15})/i);
+      const rtP = box.match(/(\d{1,3}(?:[.,]\d+)?%)/);
+      if (rtUC) cadastro_rateio_geracao_uc = rtUC[1];
+      if (rtP) cadastro_rateio_geracao_percentual = rtP[1];
 
-    if (excedente_recebido !== null && excedente_recebido >= 10000) {
-      excedente_recebido = null;
-      debug.warnings.push("excedente_recebido parecia UC; descartado");
+      if (excedente_recebido !== null && excedente_recebido >= 10000) {
+        excedente_recebido = null;
+      }
     }
   }
 
-  /* 8) ITENS – Injeção e Consumo SCEE (por linha) */
+  /* 8) ITENS – Injeção e Consumo SCEE (por linha, com preferência 6 casas decimais) */
   const itensIdx = lines.findIndex((l) => /ITENS\s+DE\s+FATURA/i.test(stripAccents(l.text)));
   const itensBlock = itensIdx >= 0 ? lines.slice(itensIdx, itensIdx + 80) : lines;
 
@@ -322,88 +366,84 @@ async function extractData(buffer, debugMode = false) {
   const injLines = findAll(itensBlock, /INJE[CÇ][AÃ]O\s+SCEE/i);
 
   for (const lo of injLines) {
-    // Captura UC explicitamente (não confundir com total)
-    const uc = (lo.text.match(/UC\s*(\d{6,15})/) || [])[1]
-      || (lo.tokens.find((t) => /UC/i.test(lo.text) && isUC(t.text))?.text)
-      || null;
+    const uc = (lo.text.match(/UC\s*(\d{6,15})/) || [])[1] || null;
     if (!uc) continue;
 
-    // Coletar NUMEROS APENAS desta linha
-    const rawNums = (lo.text.match(/[\d\.,]+/g) || []).map(num).filter((v) => v !== null);
+    const nTok = lo.tokens
+      .map(t => ({ v: num(t.text), nx: t.nx }))
+      .filter(o => o.v !== null);
 
-    // Preço unitário: menor < 2
-    const price = rawNums.find(looksPrice) || null;
+    const priceTok = pickPriceToken(nTok);
+    const qtyTok = nTok.filter(o => looksKwh(o.v)).sort((a,b)=>b.v-a.v)[0] || null;
 
-    // Quantidade: maior entre 10..10000 (evita confundir com 0.49812)
-    const qtyCandidates = rawNums.filter(looksKwh).sort((a, b) => b - a);
-    const qty = qtyCandidates.length ? qtyCandidates[0] : null;
+    let totalTok = null;
+    const totals = nTok.filter(o => o.v >= 10).sort((a,b)=>b.v-a.v); // sem piso de 50
+    if (priceTok) {
+      totalTok = totals.find(o => o.nx > priceTok.nx) || totals[0] || null;
+    } else {
+      totalTok = totals[0] || null;
+    }
 
-    // Total: maior >= 50 que não seja UC
-    const totals = rawNums.filter((v) => v >= 50);
-    let total = totals.length ? totals.sort((a, b) => b - a)[0] : null;
+    const price = priceTok?.v ?? null;
+    const qty = qtyTok?.v ?? null;
+    let total = totalTok?.v ?? null;
 
-    // proteção: se total for um número de 6+ dígitos (ex.: 11329178), é UC errada
-    if (total !== null && total >= 100000) total = null;
-
-    // validações matemáticas
+    // nunca calcular como entrega — apenas validação
     if (price && qty && total && !approxEqual(total, qty * price)) {
-      debug.warnings.push(`injecao_scee(${uc}): total!=qtd*preco (${safe2(total)} vs ${safe2(qty * price)})`);
+      // mantemos o total como está (pode vir ausente na linha); não inferir
     }
 
     injecoes_scee.push({
       uc,
       quant_kwh: safe2(qty),
-      preco_unit_com_tributos: safe2(price),
-      tarifa_unitaria: safe2(total),
+      preco_unit_com_tributos: price === null ? null : parseFloat(price.toFixed(6)), // manter 6 casas se houver
+      tarifa_unitaria: total === null ? null : safe2(total),
     });
   }
 
-  // Consumo SCEE (linha única)
+  // Consumo SCEE
   let consumo_scee_quant = null, consumo_scee_preco_unit_com_tributos = null, consumo_scee_tarifa_unitaria = null;
   {
     const lo = findLine(itensBlock, /CONSUMO\s+SCEE/i);
     if (lo) {
-      const rawNums = (lo.text.match(/[\d\.,]+/g) || []).map(num).filter((v) => v !== null);
-      const price = rawNums.find(looksPrice) || null;
-      const qty = rawNums.filter(looksKwh).sort((a, b) => b - a)[0] || null;
-      const total = rawNums.filter((v) => v >= 50).sort((a, b) => b - a)[0] || null;
+      const nTok = lo.tokens
+        .map(t => ({ v: num(t.text), nx: t.nx }))
+        .filter(o => o.v !== null);
 
-      if (price && qty && total && !approxEqual(total, qty * price)) {
-        debug.warnings.push(`consumo_scee: total!=qtd*preco (${safe2(total)} vs ${safe2(qty * price)})`);
+      const qtyTok = nTok.filter(o => looksKwh(o.v)).sort((a,b)=>b.v-a.v)[0] || null;
+      const totTok = nTok.filter(o => o.v >= 10).sort((a,b)=>b.v-a.v)[0] || null;
+
+      // preço com preferência 6 casas, depois 5, depois <2
+      let priceTok = pickPriceToken(nTok);
+      // se houver qty e total, tente um preço entre eles (coluna)
+      if ((!priceTok) && qtyTok && totTok) {
+        const between = nTok.filter(o => looksPrice(o.v) && o.nx > qtyTok.nx && o.nx < totTok.nx);
+        priceTok = pickPriceToken(between) || priceTok;
       }
 
-      // correção de duplicação qty/total (se iguais)
-      let finalTotal = total;
-      if (price && qty && total && approxEqual(total, qty)) {
-        finalTotal = qty * price;
-      }
-
-      consumo_scee_preco_unit_com_tributos = safe2(price);
-      consumo_scee_quant = safe2(qty);
-      consumo_scee_tarifa_unitaria = safe2(finalTotal);
+      consumo_scee_preco_unit_com_tributos = priceTok ? parseFloat(priceTok.v.toFixed(6)) : null;
+      consumo_scee_quant = qtyTok ? safe2(qtyTok.v) : null;
+      consumo_scee_tarifa_unitaria = totTok ? safe2(totTok.v) : null;
       setOrigin("consumo_scee", lo);
     }
   }
 
-  /* 9) Informações ao cliente / Observações (reconstrução) */
-  let informacoes_para_o_cliente = null, observacoes = null;
-  {
-    const start = lines.findIndex((l) => /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i.test(l.text));
-    if (start >= 0) {
-      const sliceText = lines.slice(start, start + 60).map((x) => x.text).join("\n");
-      const m = sliceText.match(/INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE([\s\S]+?)(?:EQUATORIAL|NOTA\s+FISCAL|$)/i);
-      if (m) informacoes_para_o_cliente = m[1].replace(/\s{2,}/g, " ").trim() || null;
-    }
-    const mObs = fullText.match(/OBSERVA[ÇC][AÃ]O[ES]?\s*[:\-]?\s*([\s\S]+)/i);
-    if (mObs) {
-      const raw = mObs[1].trim();
-      const cut = raw.split(/\n{2,}|\r{2,}/)[0];
-      observacoes = cut.trim() || null;
-    }
-  }
+  /* 9) Informações ao cliente & Observações (caixa) */
+  const informacoes_para_o_cliente = extractBox(
+    lines,
+    /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i,
+    [ /ITENS\s+DE\s+FATURA/i, /NOTA\s+FISCAL/i, /EQUATORIAL/i, /UC\s+GERADORA/i ],
+    180
+  );
 
-  // referência (mês)
-  const media = 1345; // arredondado conforme decisão anterior
+  const observacoes = extractBox(
+    lines,
+    /OBSERVA[ÇC][AÃ]O[ES]?/i,
+    [ /INFORMA[ÇC][AÃ]OES\s+PARA\s+O\s+CLIENTE/i, /ITENS\s+DE\s+FATURA/i, /NOTA\s+FISCAL/i, /EQUATORIAL/i ],
+    120
+  );
+
+  const media = 1345;
 
   const result = {
     unidade_consumidora,
@@ -431,7 +471,7 @@ async function extractData(buffer, debugMode = false) {
     uc_geradora_producao,
     cadastro_rateio_geracao_uc,
     cadastro_rateio_geracao_percentual,
-    valor_tarifa_unitaria_sem_tributos: null, // só se vier explícito
+    valor_tarifa_unitaria_sem_tributos: null,
     injecoes_scee,
     consumo_scee_quant,
     consumo_scee_preco_unit_com_tributos,
@@ -462,7 +502,7 @@ app.get("/health", (req, res) => {
   const mem = process.memoryUsage();
   res.json({
     status: "online",
-    app_name: "extract-equatorialpdfreader-v9.3",
+    app_name: "extract-equatorialpdfreader-v9.3.2",
     environment: process.env.NODE_ENV || "production",
     node_version: process.version,
     uptime_seconds: process.uptime(),
@@ -473,10 +513,10 @@ app.get("/health", (req, res) => {
     timestamp: dayjs().format("YYYY-MM-DD HH:mm:ss"),
     hostname: os.hostname(),
     port: process.env.PORT || "10000",
-    message: "Servidor Equatorial Goiás (v9.3) operacional ✅",
+    message: "Servidor Equatorial Goiás (v9.3.2) operacional ✅",
   });
 });
 
 app.listen(process.env.PORT || 10000, () => {
-  console.log("✅ Servidor Equatorial Goiás v9.3 na porta 10000");
+  console.log("✅ Servidor Equatorial Goiás v9.3.2 na porta 10000");
 });
