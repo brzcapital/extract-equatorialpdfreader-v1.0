@@ -51,7 +51,6 @@
 // - Informações/Observações: extrator de caixa mais robusto
 // index.mjs v9.3.3 – Equatorial Goiás PDFReader
 // Inclui função extractData() e correções consolidadas
-@@ -49,6 +49,8 @@
 // - Injeção SCEE: ignora números acoplados a '%'
 // - Consumo SCEE: detecta total correto e adiciona valor_sem_tributos
 // - Informações/Observações: extrator de caixa mais robusto
